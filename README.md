@@ -9,15 +9,27 @@ that coordinates admission and execution ordering for mixed LLM/VLM workloads.
 - Include a small simulator to exercise the policy.
 
 ### Project Structure
-- `src/models.py`: core data structures (Task, GPUState, results)
-- `src/scheduler.py`: memory-aware admission + ordering policy
-- `src/metrics.py`: basic evaluation metrics
-- `src/simulate.py`: synthetic workload generator and runner
+- `scripts/models.py`: core data structures (Task, GPUState, results)
+- `scripts/scheduler.py`: memory-aware policy + FIFO baseline
+- `scripts/metrics.py`: evaluation metrics
+- `scripts/simulate.py`: synthetic workload generator and runner
+- `scripts/experiment.py`: multi-seed baseline experiments
+- `scripts/event_logger.py`: JSONL event logger for admission/dispatch traces
 - `docs/PROPOSAL.md`: project context and timeline
 
 ### Quick Start
 ```
-python -m src.simulate --tasks 100 --gpus 2 --gpu_mem 24
+python -m scripts.simulate --tasks 120 --gpus 2 --gpu_mem 24 --policy both --workload mixed
+```
+
+Run multi-seed baseline experiments:
+```
+python -m scripts.experiment --tasks 200 --gpus 2 --gpu_mem 24 --workload mixed
+```
+
+Enable per-decision logs for report evidence:
+```
+python -m scripts.simulate --policy both --log_dir logs
 ```
 
 ### Notes
