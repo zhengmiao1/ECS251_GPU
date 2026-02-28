@@ -18,16 +18,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-_METRICS_DISPLAY: List[Tuple[str, str, bool]] = [
-    # (key, label, lower_is_better)
-    ("completed_tasks",   "Completed Tasks",        False),
-    ("avg_wait_time",     "Avg Wait Time (s)",      True),
-    ("p95_wait_time",     "P95 Wait Time (s)",      True),
-    ("avg_turnaround",    "Avg Turnaround (s)",     True),
-    ("throughput",        "Throughput (tasks/s)",   False),
-    ("utilization",       "GPU Utilization",        False),
-    ("fairness_wait_std", "Fairness Wait Std (s)",  True),
-    ("oom_events",        "OOM Events",             True),
+_METRICS_DISPLAY: List[Tuple[str, str, bool, str]] = [
+    # (key, label, lower_is_better, y_axis_unit)
+    ("completed_tasks",   "Completed Tasks",       False, "tasks"),
+    ("avg_wait_time",     "Avg Wait Time",         True,  "seconds"),
+    ("p95_wait_time",     "P95 Wait Time",         True,  "seconds"),
+    ("avg_turnaround",    "Avg Turnaround",        True,  "seconds"),
+    ("throughput",        "Throughput",            False, "tasks / s"),
+    ("utilization",       "GPU Utilization",       False, "fraction [0–1]"),
+    ("fairness_wait_std", "Fairness (Wait Std)",   True,  "seconds"),
+    ("oom_events",        "OOM Events",            True,  "count"),
 ]
 
 
@@ -59,7 +59,7 @@ def print_markdown_table(
     """Print a markdown table comparing policies for one workload."""
     policies = list(data.keys())
     metric_keys = [m[0] for m in _METRICS_DISPLAY]
-    metric_labels = [m[1] for m in _METRICS_DISPLAY]
+    metric_labels = [f"{m[1]} ({m[3]})" for m in _METRICS_DISPLAY]
 
     header = "| Metric | " + " | ".join(policies) + " |"
     sep = "|---|" + "---|" * len(policies)
@@ -89,6 +89,7 @@ def plot_workload(
     policies = list(data.keys())
     metric_keys = [m[0] for m in _METRICS_DISPLAY]
     metric_labels = [m[1] for m in _METRICS_DISPLAY]
+    unit_labels = [m[3] for m in _METRICS_DISPLAY]
     lower_flags = [m[2] for m in _METRICS_DISPLAY]
 
     n_metrics = len(metric_keys)
@@ -100,10 +101,20 @@ def plot_workload(
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"]
     bar_width = 0.6 / len(policies)
 
-    for ax_idx, (key, label, lower) in enumerate(zip(metric_keys, metric_labels, lower_flags)):
+    for ax_idx, (key, label, unit, lower) in enumerate(
+        zip(metric_keys, metric_labels, unit_labels, lower_flags)
+    ):
         ax = axes_flat[ax_idx]
         xs = range(len(policies))
         vals = [data[p].get(key, 0.0) for p in policies]
+
+        # Determine which policy wins for caption
+        if lower:
+            winner_idx = vals.index(min(vals))
+        else:
+            winner_idx = vals.index(max(vals))
+        winner = policies[winner_idx]
+
         bars = ax.bar(
             [x + bar_width * i for i, x in enumerate(xs)],
             vals,
@@ -111,12 +122,14 @@ def plot_workload(
             color=[colors[i % len(colors)] for i in range(len(policies))],
             label=policies,
         )
-        ax.set_title(label, fontsize=10)
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.set_ylabel(unit, fontsize=8)
         ax.set_xticks([x + bar_width * (len(policies) - 1) / 2 for x in xs])
         ax.set_xticklabels(policies, fontsize=9)
         ax.tick_params(axis="y", labelsize=8)
-        indicator = "(lower=better)" if lower else "(higher=better)"
-        ax.set_xlabel(indicator, fontsize=7)
+        direction = "lower=better" if lower else "higher=better"
+        caption = f"{direction} · best: {winner}"
+        ax.set_xlabel(caption, fontsize=7)
         for bar, val in zip(bars, vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from .event_logger import JsonlEventLogger
 from .models import Task
@@ -55,6 +55,117 @@ def generate_tasks(
     return tasks
 
 
+def _load_tasks_from_db(db_path: str, run_id: int) -> tuple[List[Task], str, int, int, float]:
+    """
+    Reconstruct the original task list from a stored run in SQLite.
+    Returns (tasks, policy, gpus, seed, gpu_mem_gb).
+    """
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    run_row = conn.execute(
+        "SELECT policy, gpus, seed, gpu_mem_gb FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if run_row is None:
+        conn.close()
+        raise ValueError(f"run_id={run_id} not found in {db_path}")
+
+    policy = run_row["policy"]
+    gpus = run_row["gpus"]
+    seed = run_row["seed"]
+    gpu_mem_gb = run_row["gpu_mem_gb"]
+
+    decision_rows = conn.execute(
+        "SELECT task_id, user_id, arrival_time, est_duration, est_mem_gb, duration_class "
+        "FROM decisions WHERE run_id = ? ORDER BY arrival_time",
+        (run_id,),
+    ).fetchall()
+    conn.close()
+
+    seen: dict[str, Task] = {}
+    tasks: List[Task] = []
+    for row in decision_rows:
+        tid = row["task_id"]
+        if tid not in seen:
+            t = Task(
+                task_id=tid,
+                user_id=row["user_id"],
+                arrival_time=row["arrival_time"],
+                est_duration=row["est_duration"],
+                est_mem_gb=row["est_mem_gb"],
+                duration_class=row["duration_class"],
+            )
+            seen[tid] = t
+            tasks.append(t)
+
+    return tasks, policy, gpus, seed, gpu_mem_gb
+
+
+def _replay_run(
+    db_path: str,
+    run_id: int,
+    short_threshold: float,
+    aging_window: float,
+) -> None:
+    """
+    Reconstruct and re-execute a stored run; compare replayed metrics to stored ones.
+    """
+    from .db_store import ExperimentStore
+    from .metrics import summarize_results as _summarize
+
+    tasks, policy, gpus, seed, gpu_mem_gb = _load_tasks_from_db(db_path, run_id)
+
+    print(f"\n[replay] run_id={run_id}  policy={policy}  gpus={gpus}  "
+          f"gpu_mem={gpu_mem_gb} GB  seed={seed}  tasks={len(tasks)}")
+
+    gpu_list = build_default_gpus(gpus, gpu_mem_gb)
+    config = SchedulerConfig(short_threshold=short_threshold, aging_window=aging_window)
+    if policy == "memory":
+        scheduler = MemoryAwareScheduler(gpus=gpu_list, config=config)
+    else:
+        scheduler = FIFOScheduler(gpus=gpu_list, config=config)
+
+    replayed_result = scheduler.schedule(tasks)
+    replayed_metrics = _summarize(replayed_result, num_gpus=gpus)
+
+    # Load stored metrics from DB
+    store = ExperimentStore(db_path)
+    stored_rows = store._conn.execute(
+        "SELECT wait_time, end_time - arrival_time AS turnaround "
+        "FROM task_results WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    store.close()
+
+    if stored_rows:
+        n = len(stored_rows)
+        stored_avg_wait = sum(r["wait_time"] for r in stored_rows) / n
+        stored_avg_ta = sum(r["turnaround"] for r in stored_rows) / n
+    else:
+        stored_avg_wait = stored_avg_ta = 0.0
+
+    # Query stored OOM count (store is already closed — open a fresh connection)
+    _store2 = ExperimentStore(db_path)
+    stored_oom = float(_store2._conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE run_id=? AND admitted=0", (run_id,)
+    ).fetchone()[0])
+    _store2.close()
+
+    comparisons = [
+        ("completed_tasks", float(len(stored_rows)),   float(replayed_metrics["completed_tasks"])),
+        ("avg_wait_time",   round(stored_avg_wait, 3), replayed_metrics["avg_wait_time"]),
+        ("avg_turnaround",  round(stored_avg_ta, 3),   replayed_metrics["avg_turnaround"]),
+        ("oom_events",      stored_oom,                float(replayed_metrics["oom_events"])),
+    ]
+
+    print(f"\n{'Metric':<22} {'Stored':>12} {'Replayed':>12} {'Match':>8}")
+    print("-" * 58)
+    for metric, stored_val, replayed_val in comparisons:
+        match = "OK" if abs(stored_val - replayed_val) < 1e-3 else "DIFF"
+        print(f"{metric:<22} {stored_val:>12.3f} {replayed_val:>12.3f} {match:>8}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks", type=int, default=100)
@@ -67,7 +178,31 @@ def main() -> None:
     parser.add_argument("--policy", choices=["memory", "fifo", "both"], default="both")
     parser.add_argument("--workload", choices=["mixed", "llm_heavy", "vlm_heavy"], default="mixed")
     parser.add_argument("--log_dir", type=str, default="")
+    # Replay mode (Zaishuo Xia, Week 4)
+    parser.add_argument(
+        "--replay",
+        type=str,
+        default="",
+        metavar="DB_PATH",
+        help="SQLite DB path; replays the run specified by --run_id",
+    )
+    parser.add_argument(
+        "--run_id",
+        type=int,
+        default=1,
+        help="run_id to replay from --replay DB",
+    )
     args = parser.parse_args()
+
+    # --replay mode: reconstruct + re-execute a stored run
+    if args.replay:
+        _replay_run(
+            db_path=args.replay,
+            run_id=args.run_id,
+            short_threshold=args.short_threshold,
+            aging_window=args.aging_window,
+        )
+        return
 
     tasks = generate_tasks(
         n=args.tasks,
