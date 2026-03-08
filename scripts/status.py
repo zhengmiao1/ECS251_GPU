@@ -23,6 +23,7 @@ _STATUS_COLORS = {
     "done":      "\033[34m",   # blue
     "failed":    "\033[31m",   # red
     "cancelled": "\033[90m",   # dark grey
+    "rejected":  "\033[35m",   # magenta
 }
 _RESET = "\033[0m"
 
@@ -68,13 +69,18 @@ def print_jobs(jobs: List[Dict], title: str) -> None:
     print(f"\n=== {title} ({len(jobs)}) ===")
     for j in jobs:
         status = j["status"]
-        gpu_str = f"gpu={j['gpu_id']}" if j.get("gpu_id") is not None else "gpu=?"
+        num_gpus = j.get("num_gpus") or 1
+        gpu_raw = j.get("gpu_id")
+        if gpu_raw is not None:
+            gpu_str = f"gpu={gpu_raw}" + (" [x2]" if num_gpus > 1 else "")
+        else:
+            gpu_str = f"gpu=?  need={num_gpus}GPU{'s' if num_gpus > 1 else ' '}"
         est_str = _fmt_secs(j.get("est_secs", 0))
         label = f"{status.upper():<9}"
         base = (
             f"  [{j['job_id']:>4}] {_color(status, label)}  "
-            f"user={j['user_id']:<10}  mem={j['mem_mb']:>5}MB  est={est_str:>6}  "
-            f"pri={j['priority']}  {gpu_str}"
+            f"user={j['user_id']:<10}  mem={j['mem_mb']:>5}MB  ngpu={num_gpus}  "
+            f"est={est_str:>6}  pri={j['priority']}  {gpu_str}"
         )
         if status == "running":
             base += f"  pid={j['pid']}  started={j.get('started_at','?')}"
@@ -124,11 +130,17 @@ def main() -> None:
 
     running  = [j for j in jobs if j["status"] == "running"]
     pending  = [j for j in jobs if j["status"] == "pending"]
-    finished = [j for j in jobs if j["status"] in ("done", "failed", "cancelled")]
+    done     = [j for j in jobs if j["status"] in ("done", "cancelled")]
+    failed   = [j for j in jobs if j["status"] == "failed"
+                and not (j.get("note") or "").startswith("rejected:")]
+    rejected = [j for j in jobs if j["status"] == "failed"
+                and (j.get("note") or "").startswith("rejected:")]
 
     print_jobs(running,  "Running")
-    print_jobs(pending,  "Pending")
-    print_jobs(finished, "Recent Completed")
+    print_jobs(pending,  "Pending (queued)")
+    print_jobs(rejected, "Rejected")
+    print_jobs(failed,   "Failed")
+    print_jobs(done,     "Recent Completed")
     print()
 
 

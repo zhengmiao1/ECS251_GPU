@@ -1,208 +1,112 @@
-## ECS251 GPU Scheduling Project
+# ECS251 GPU Scheduling Project
 
-This repository contains two related systems:
+A GPU job scheduler that manages multiple users sharing a cluster of GPUs. Users submit jobs specifying how much GPU memory and how many GPUs they need. The scheduler assigns GPUs, queues jobs when resources are full, enforces a per-job GPU limit, and respects user-defined priorities.
 
-1. **Simulation** (`scheduler.py`, `simulate.py`, `experiment.py`) — discrete-event
-   simulator for comparing memory-aware vs FIFO scheduling policies on synthetic LLM/VLM workloads.
-
-2. **Real GPU Scheduler** (`daemon.py`, `submit.py`, `status.py`, `cancel.py`) —
-   a deployable SLURM-like daemon that monitors live GPU memory via `nvidia-smi` and
-   dispatches user jobs to GPUs with sufficient free memory, supporting GPU sharing.
+The project includes a live daemon that reads actual GPU state via `nvidia-smi` and dispatches jobs as real OS processes, and a mock demo mode that simulates GPUs in software so you can run everything without any GPU hardware.
 
 ---
 
-### Project Structure
+## How the Scheduler Works
 
-```
-scripts/
-  models.py          core data structures (simulation)
-  scheduler.py       memory-aware policy + FIFO baseline (simulation)
-  metrics.py         evaluation metrics (simulation)
-  simulate.py        synthetic workload generator/runner
-  experiment.py      multi-seed baseline experiments
-  plot_results.py    bar charts + markdown tables from experiment CSVs
-  analysis.py        priority-inversion detection + formal policy spec
-  db_store.py        SQLite persistence for experiment runs
-  event_logger.py    JSONL event logger for admission/dispatch traces
-  gpu_monitor.py     nvidia-smi interface (real scheduler)
-  job_store.py       SQLite job queue (real scheduler)
-  daemon.py          scheduler daemon – main loop (real scheduler)
-  submit.py          CLI: submit a job (real scheduler)
-  status.py          CLI: view GPU state + queue (real scheduler)
-  cancel.py          CLI: cancel/kill a job (real scheduler)
-docs/
-  PROPOSAL.md        project proposal
-  explain.md         detailed implementation explanation
-```
+1. Users submit jobs specifying `--mem_gb`, `--num_gpus`, and optionally `--priority`.
+2. The daemon polls GPU state every few seconds and tries to dispatch pending jobs.
+3. **GPU assignment strategy:**
+   - First, assign to fully idle GPUs (no other jobs running on them).
+   - If no idle GPU has enough free memory, fall back to busy GPUs that still have room.
+4. If a job requests more GPUs than the system's `--max_gpus` limit, it is **immediately rejected**.
+5. If no GPU has enough free memory, the job **waits in queue**.
+6. Queue order: higher `--priority` first; same priority is served in submission order (FIFO).
 
 ---
 
-## Quickest Demo (self-contained, no GPU needed)
+## Running the Real Scheduler (Step by Step)
 
-Run the interactive mock demo — simulates 5 users submitting 8 jobs with a live
-dashboard showing queue/running/done state at each stage:
+### Step 1 — Start the daemon
 
-```bash
-python -m scripts.demo                 # ~35 second demo
-python -m scripts.demo --speed 4      # 4x faster (~9 seconds)
-python -m scripts.demo --gpus 1       # single GPU — more contention, longer queues
-```
+Without a GPU (mock mode):
 
----
-
-## Real GPU Scheduler — Step-by-Step
-
-### Step 1: Start the daemon
-
-**With real NVIDIA GPUs:**
-```bash
-python -m scripts.daemon --db scheduler.db --poll 10 --buffer_mb 512
-```
-
-**Without a GPU (mock mode for testing):**
 ```bash
 python -m scripts.daemon --mock --mock_gpus 2 --mock_mem_gb 24 --poll 3 --db scheduler.db
 ```
 
-Leave this running in a terminal.  It will log GPU state and scheduling decisions
-every `--poll` seconds.
+With real NVIDIA GPUs:
+
+```bash
+python -m scripts.daemon --db scheduler.db --poll 10 --buffer_mb 512
+```
+
+Add `--max_gpus 2` to cap how many GPUs any single job may request.
+
+### Step 2 — Submit jobs
+
+```bash
+# Alice: 8 GB, 1 GPU, estimated 2 hours
+python -m scripts.submit --user alice --mem_gb 8 --num_gpus 1 --est_hours 2 \
+    --cmd "python train.py" --db scheduler.db
+
+# Bob: 4 GB, high priority
+python -m scripts.submit --user bob --mem_gb 4 --est_mins 30 --priority 2 \
+    --cmd "python eval.py" --db scheduler.db
+
+# Carol: 2 GPUs, 16 GB total
+python -m scripts.submit --user carol --mem_gb 16 --num_gpus 2 --est_hours 4 \
+    --cmd "python pretrain.py" --db scheduler.db
+```
+
+### Step 3 — Check status
+
+```bash
+python -m scripts.status --db scheduler.db          # all jobs + GPU state
+python -m scripts.status --user alice --db scheduler.db   # filter by user
+python -m scripts.status --mock --db scheduler.db   # mock GPU state
+```
+
+### Step 4 — Cancel a job
+
+```bash
+python -m scripts.cancel --job_id 3 --db scheduler.db          # cancel pending
+python -m scripts.cancel --job_id 2 --force --db scheduler.db  # kill running
+```
+
+### Step 5 — Stop the daemon
+
+Press `Ctrl+C`. The daemon finishes the current poll cycle and exits cleanly.
 
 ---
 
-### Step 2: Submit jobs
+## Simulation (No GPU Needed)
 
-Open another terminal and submit jobs from different users:
+Run the interactive scenario demo — no GPU or setup required:
 
 ```bash
-# Alice submits a training job needing 8 GB, estimated 2 hours
-python -m scripts.submit --user alice --mem_gb 8 --est_hours 2 \
-    --cmd "python train.py --dataset imagenet" --db scheduler.db
-
-# Bob submits a quick evaluation needing 4 GB, 30 minutes
-python -m scripts.submit --user bob --mem_gb 4 --est_mins 30 \
-    --cmd "python eval.py --checkpoint ckpt.pt" --db scheduler.db
-
-# Carol submits a large job needing 20 GB
-python -m scripts.submit --user carol --mem_gb 20 --est_hours 4 \
-    --cmd "python pretrain.py --config large.yaml" --db scheduler.db
-
-# Dave submits an urgent job with higher priority
-python -m scripts.submit --user dave --mem_gb 6 --est_mins 15 \
-    --cmd "python inference.py" --priority 1 --db scheduler.db
+python -m scripts.demo                   # run all four scenarios
+python -m scripts.demo --scenario 1      # run one specific scenario
+python -m scripts.demo --speed 3         # 3x faster
 ```
 
-The daemon dispatches each job to a GPU with enough free memory (including GPUs
-that already have other jobs running, as long as memory fits).
+Each scenario is self-contained and starts from a clean state:
+
+| Scenario | What it shows |
+| --- | --- |
+| 1 — No Conflict | Jobs arrive on idle GPUs and are dispatched immediately, one per GPU |
+| 2 — GPU Sharing | New jobs are placed on busy GPUs that still have free memory |
+| 3 — Conflict | Queue forms; high-priority job jumps ahead; 3-GPU job rejected instantly |
+| 4 — Resolution | Short jobs finish; queue drains in priority order; large job waits for a nearly-empty GPU |
 
 ---
 
-### Step 3: Check status
-
-```bash
-# View GPU state + all queued/running/completed jobs
-python -m scripts.status --db scheduler.db
-
-# Filter by user
-python -m scripts.status --user alice --db scheduler.db
-
-# Show all history
-python -m scripts.status --all --db scheduler.db
-
-# Mock mode status (no NVIDIA GPU)
-python -m scripts.status --mock --db scheduler.db
-```
-
-Example output:
-```
-=== GPU State ===
-  GPU 0  NVIDIA A100-SXM4         [########--------]  12288/24576 MB (50%)
-  GPU 1  NVIDIA A100-SXM4         [####------------]   6144/24576 MB (25%)
-
-=== Running (3) ===
-  [   1] RUNNING    user=alice      mem= 8192MB  est=  7200s  pri=0  gpu=0  pid=18432  started=2026-03-07T10:00:05
-           cmd: python train.py --dataset imagenet
-  [   2] RUNNING    user=bob        mem= 4096MB  est=  1800s  pri=0  gpu=1  pid=18445  started=2026-03-07T10:00:05
-           cmd: python eval.py --checkpoint ckpt.pt
-  [   4] RUNNING    user=dave       mem= 6144MB  est=   900s  pri=1  gpu=0  pid=18460  started=2026-03-07T10:00:15
-           cmd: python inference.py
-
-=== Pending (1) ===
-  [   3] PENDING    user=carol      mem=20480MB  est= 14400s  pri=0  gpu=?  submitted=2026-03-07T10:00:10
-           cmd: python pretrain.py --config large.yaml
-```
-
-Carol's 20 GB job stays pending until a GPU frees up enough memory.
-
----
-
-### Step 4: Cancel a job
-
-```bash
-# Cancel a pending job
-python -m scripts.cancel --job_id 3 --db scheduler.db
-
-# Force-kill a running job (sends SIGKILL)
-python -m scripts.cancel --job_id 2 --force --db scheduler.db
-```
-
----
-
-### Step 5: Stop the daemon
-
-Press `Ctrl+C` in the daemon terminal.  The daemon catches `SIGINT` and shuts down
-cleanly after the current poll cycle.
-
----
-
-## GPU Sharing Example
-
-Unlike exclusive schedulers, this daemon allows multiple jobs on the same GPU:
+## Project Structure
 
 ```
-GPU 0  24 GB total
-  job 1  alice   8 GB  (running)
-  job 4  dave    6 GB  (running)
-  free:  24 - 8 - 6 - 0.5 buffer = 9.5 GB  →  can accept up to ~9 GB more
+scripts/
+  daemon.py          scheduler daemon — main poll loop
+  submit.py          CLI: submit a job
+  status.py          CLI: view GPU state and queue
+  cancel.py          CLI: cancel or kill a job
+  job_store.py       SQLite job queue
+  gpu_monitor.py     nvidia-smi interface + mock GPU support
+  demo.py            scenario demo (no GPU needed)
+docs/
+  explain.md         full implementation walkthrough
+  Functions.md       function reference by topic
 ```
-
-The daemon will keep assigning jobs to GPU 0 until memory is exhausted,
-then fall back to GPU 1, then defer until memory becomes available.
-
----
-
-## Simulation (Original)
-
-Quick single run comparing memory-aware vs FIFO:
-```bash
-python -m scripts.simulate --tasks 120 --gpus 2 --gpu_mem 24 --policy both --workload mixed
-```
-
-Multi-seed batch experiment:
-```bash
-python -m scripts.experiment --tasks 200 --gpus 2 --gpu_mem 24 --batch --out_csv results/
-```
-
-Generate comparison charts:
-```bash
-python -m scripts.plot_results --csv_dir results/ --out_dir figures/
-```
-
-Priority-inversion analysis + formal policy spec:
-```bash
-python -m scripts.analysis --tasks 100 --seed 7 --workload mixed
-```
-
----
-
-## Key Design Decisions
-
-| Decision | Choice | Reason |
-|---|---|---|
-| Memory source | `nvidia-smi` | Ground truth; handles any CUDA workload |
-| GPU sharing | Allowed | Maximises utilisation for inference/mixed workloads |
-| Job ordering | FIFO + priority | Fair ordering within priority tier; no starvation via explicit priority |
-| Memory buffer | 512 MB default | Absorbs CUDA driver overhead + estimation errors |
-| Grace period | 30 s default | Prevents double-booking during CUDA context init lag |
-| Persistence | SQLite WAL | Survives daemon restart; concurrent read-access |
-
-See `docs/explain.md` for the full implementation walkthrough.

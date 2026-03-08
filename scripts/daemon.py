@@ -7,25 +7,31 @@ jobs can run on the same GPU as long as the total committed memory fits.
 
 Key design decisions
 --------------------
-1. Memory accounting: effective_free[gpu] = nvidia-smi reported free
+1. GPU assignment priority:
+   - FIRST try to assign to fully idle GPUs (no running jobs on them).
+   - ONLY if there are not enough idle GPUs, fall back to partially-used
+     GPUs that still have enough free memory.
+   This keeps busy GPUs consolidated and leaves idle GPUs available for
+   jobs that cannot share.
+
+2. Rejection: jobs requesting more GPUs than `max_gpus` are immediately
+   rejected (marked failed) rather than waiting in queue forever.
+
+3. Memory accounting: effective_free[gpu] = nvidia-smi reported free
    MINUS memory committed to jobs we launched in the last `grace_secs`
    seconds (which may not yet show in nvidia-smi).  This prevents
    double-booking during the lag between job launch and GPU memory claim.
 
-2. GPU selection: "most-free-first" (best-fit descending) to pack jobs
-   onto fewer GPUs and leave headroom for large jobs.
+4. Job ordering: pending queue sorted by priority DESC, submitted_at ASC
+   (FIFO within same priority).
 
-3. Job ordering: pending queue sorted by priority DESC, est_secs ASC
-   (shortest estimated runtime first), then submission time ASC.
-   This minimises average wait for short jobs while preventing starvation
-   of long jobs via explicit priority escalation at submission time.
-
-4. Safety buffer: `buffer_mb` MB is kept free on every GPU to absorb
+5. Safety buffer: `buffer_mb` MB is kept free on every GPU to absorb
    estimation errors and CUDA/driver overhead.
 
 Usage
 -----
-    python -m scripts.daemon [--db scheduler.db] [--poll 10] [--buffer_mb 512] [--mock]
+    python -m scripts.daemon [--db scheduler.db] [--poll 10] [--buffer_mb 512]
+                             [--max_gpus 4] [--mock]
 """
 from __future__ import annotations
 
@@ -57,6 +63,7 @@ class SchedulerDaemon:
         poll_interval: float = 10.0,
         buffer_mb: int = 512,
         grace_secs: float = 30.0,
+        max_gpus: Optional[int] = None,
         mock: bool = False,
         mock_gpus_count: int = 2,
         mock_gpu_mem_mb: int = 24576,
@@ -65,13 +72,14 @@ class SchedulerDaemon:
         self.poll_interval = poll_interval
         self.buffer_mb = buffer_mb
         self.grace_secs = grace_secs
+        self.max_gpus = max_gpus  # None means "no limit beyond available GPUs"
         self.mock = mock
         self._mock_gpus = mock_gpus(mock_gpus_count, mock_gpu_mem_mb) if mock else []
 
         # job_id -> subprocess.Popen  (for jobs launched by this daemon instance)
         self._procs: Dict[int, subprocess.Popen] = {}
 
-        # job_id -> (gpu_id, mem_mb, launch_epoch)
+        # job_id -> (gpu_ids: List[int], mem_mb, launch_epoch)
         # Tracks recent launches whose memory may not yet appear in nvidia-smi
         self._recent: Dict[int, tuple] = {}
 
@@ -83,8 +91,6 @@ class SchedulerDaemon:
 
     def _get_gpus(self) -> List[GPUInfo]:
         if self.mock:
-            # In mock mode, keep a stable list but update used_mem_mb
-            # based on our own running-job accounting so the demo is realistic.
             committed = self._committed_per_gpu()
             for g in self._mock_gpus:
                 used = committed.get(g.gpu_id, 0)
@@ -94,7 +100,7 @@ class SchedulerDaemon:
         return query_gpus()
 
     def _committed_per_gpu(self) -> Dict[int, int]:
-        """Sum of mem_mb for all jobs currently running, split evenly across their assigned GPUs."""
+        """Sum of mem_mb for all jobs currently running, split across their assigned GPUs."""
         committed: Dict[int, int] = {}
         for job in self.store.get_running():
             gpu_id_str = job.get("gpu_id")
@@ -110,7 +116,6 @@ class SchedulerDaemon:
         """
         Effective free memory per GPU = nvidia-smi free
         minus memory committed to recently launched jobs (grace period).
-        _recent stores: job_id -> (gpu_ids: List[int], mem_mb, epoch)
         """
         free: Dict[int, int] = {g.gpu_id: g.free_mem_mb for g in gpus}
         now = time.time()
@@ -126,52 +131,57 @@ class SchedulerDaemon:
             del self._recent[jid]
         return free
 
-    def _pick_gpus(self, needed_mb: int, free: Dict[int, int]) -> Optional[List[int]]:
+    def _pick_gpus(
+        self,
+        needed_mb: int,
+        num_gpus: int,
+        free: Dict[int, int],
+        committed: Dict[int, int],
+    ) -> Optional[List[int]]:
         """
-        Try to find GPU(s) for a job needing `needed_mb` MB.
+        Find `num_gpus` GPUs for the job using a two-tier strategy:
 
-        Strategy:
-          1. Single GPU: pick the GPU with most free memory >= needed_mb + buffer.
-          2. Multi-GPU pair: if no single GPU fits, find the pair whose combined
-             free memory fits, with each GPU contributing at least its share
-             (needed_mb / 2).  Memory is assumed to be split evenly across GPUs.
+        Tier 1 – Idle GPUs (no committed memory): assign here first.
+                 Keeps idle GPUs available for large exclusive jobs and
+                 avoids unnecessary contention.
 
-        Returns a list of GPU ids (length 1 or 2), or None if no fit found.
+        Tier 2 – Busy GPUs with remaining memory: use only if there are
+                 not enough idle GPUs that each fit their share of the job.
+
+        Within each tier, prefer GPUs with the most free memory (best-fit
+        descending) to maximise remaining headroom.
+
+        Returns a sorted list of GPU ids, or None if no valid assignment.
         """
-        # --- single GPU ---
-        single_candidates = {
-            gid: fm for gid, fm in free.items()
-            if fm - self.buffer_mb >= needed_mb
-        }
-        if single_candidates:
-            return [max(single_candidates, key=lambda g: single_candidates[g])]
+        share = (needed_mb + num_gpus - 1) // num_gpus  # ceil(total / n) per GPU
 
-        # --- multi-GPU pair ---
-        share = (needed_mb + 1) // 2   # each GPU must hold at least this much
-        gpu_ids = sorted(free.keys())
-        best_pair: Optional[List[int]] = None
-        best_total = 0
-        for i in range(len(gpu_ids)):
-            for j in range(i + 1, len(gpu_ids)):
-                g1, g2 = gpu_ids[i], gpu_ids[j]
-                if (free[g1] - self.buffer_mb >= share and
-                        free[g2] - self.buffer_mb >= share):
-                    total = free[g1] + free[g2]
-                    if total > best_total:
-                        best_total = total
-                        best_pair = [g1, g2]
-        return best_pair
+        # Split eligible GPUs into idle vs busy
+        idle: List[int] = []
+        busy: List[int] = []
+        for gid, fm in free.items():
+            if fm - self.buffer_mb < share:
+                continue  # not enough room for this job's share
+            if committed.get(gid, 0) == 0:
+                idle.append(gid)
+            else:
+                busy.append(gid)
+
+        # Sort each tier by descending free memory
+        idle.sort(key=lambda g: free[g], reverse=True)
+        busy.sort(key=lambda g: free[g], reverse=True)
+
+        # Prefer idle GPUs; fill remainder from busy if needed
+        selected = (idle + busy)[:num_gpus]
+        if len(selected) < num_gpus:
+            return None
+        return sorted(selected)
 
     # ------------------------------------------------------------------
     # Job lifecycle
     # ------------------------------------------------------------------
 
     def _launch(self, job: Dict, gpu_ids: List[int]) -> Optional[int]:
-        """
-        Fork a subprocess for the job with CUDA_VISIBLE_DEVICES set.
-        gpu_ids may be [0] for single-GPU or [0,1] for multi-GPU.
-        Returns the PID on success, None on failure.
-        """
+        """Fork a subprocess for the job with CUDA_VISIBLE_DEVICES set."""
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
         env["SCHEDULER_JOB_ID"] = str(job["job_id"])
@@ -210,11 +220,11 @@ class SchedulerDaemon:
         Jobs marked 'running' in the DB but whose PID no longer exists
         (daemon was restarted).  Mark them failed so they don't block scheduling.
         """
-        import psutil  # optional dependency
+        import psutil
         for job in self.store.get_running():
             jid = job["job_id"]
             if jid in self._procs:
-                continue  # we own this process
+                continue
             pid = job.get("pid")
             if pid is None:
                 continue
@@ -231,15 +241,35 @@ class SchedulerDaemon:
     # ------------------------------------------------------------------
 
     def _schedule(self, gpus: List[GPUInfo]) -> None:
+        total_gpus = len(gpus)
+        gpu_limit = self.max_gpus if self.max_gpus is not None else total_gpus
+
         free = self._effective_free(gpus)
+        committed = self._committed_per_gpu()
         pending = self.store.get_pending()
 
         for job in pending:
-            gpu_ids = self._pick_gpus(job["mem_mb"], free)
+            num_gpus = job.get("num_gpus") or 1
+
+            # --- Rejection: job asks for more GPUs than the system allows ---
+            if num_gpus > gpu_limit:
+                reason = (
+                    f"rejected: requested {num_gpus} GPU(s) exceeds "
+                    f"max_gpus limit of {gpu_limit}"
+                )
+                self.store.reject(job["job_id"], reason)
+                log.warning(
+                    "Rejected job %d  user=%s  requested %d GPUs (limit=%d)",
+                    job["job_id"], job["user_id"], num_gpus, gpu_limit,
+                )
+                continue
+
+            # --- Try to assign GPUs (idle first, then partially-used) ---
+            gpu_ids = self._pick_gpus(job["mem_mb"], num_gpus, free, committed)
             if gpu_ids is None:
                 log.debug(
-                    "Job %d deferred  user=%s  need=%dMB  free=%s",
-                    job["job_id"], job["user_id"], job["mem_mb"],
+                    "Job %d deferred  user=%s  need=%dMB x %dGPU  free=%s",
+                    job["job_id"], job["user_id"], job["mem_mb"], num_gpus,
                     {gid: f"{fm}MB" for gid, fm in free.items()},
                 )
                 continue
@@ -252,14 +282,19 @@ class SchedulerDaemon:
             self.store.mark_running(job["job_id"], gpu_id_str, pid)
             self._recent[job["job_id"]] = (gpu_ids, job["mem_mb"], time.time())
 
+            # Update in-loop accounting so subsequent jobs in this cycle see updated free memory
             share = job["mem_mb"] // len(gpu_ids)
             for gid in gpu_ids:
                 free[gid] = max(0, free[gid] - share)
+                committed[gid] = committed.get(gid, 0) + share
 
+            idle_flag = all(committed.get(gid, 0) == share for gid in gpu_ids)
+            placement = "idle-GPU" if idle_flag else "shared-GPU"
             multi = " [MULTI-GPU]" if len(gpu_ids) > 1 else ""
             log.info(
-                "Dispatched job %d  user=%-8s  mem=%4dMB  gpu=%s  pid=%d%s",
-                job["job_id"], job["user_id"], job["mem_mb"], gpu_id_str, pid, multi,
+                "Dispatched job %d  user=%-8s  mem=%4dMB  gpu=%s  pid=%d  %s%s",
+                job["job_id"], job["user_id"], job["mem_mb"], gpu_id_str, pid,
+                placement, multi,
             )
 
     # ------------------------------------------------------------------
@@ -281,17 +316,17 @@ class SchedulerDaemon:
 
     def run(self) -> None:
         log.info(
-            "Daemon started  poll=%.0fs  buffer=%dMB  grace=%.0fs  mock=%s",
-            self.poll_interval, self.buffer_mb, self.grace_secs, self.mock,
+            "Daemon started  poll=%.0fs  buffer=%dMB  grace=%.0fs  max_gpus=%s  mock=%s",
+            self.poll_interval, self.buffer_mb, self.grace_secs,
+            self.max_gpus if self.max_gpus is not None else "auto",
+            self.mock,
         )
         try:
             signal.signal(signal.SIGINT, self._handle_signal)
             signal.signal(signal.SIGTERM, self._handle_signal)
         except ValueError:
-            # signal() can only be called from the main thread; ignore in test/thread contexts
             pass
 
-        # Try to reap jobs from a previous daemon run
         try:
             import psutil  # noqa: F401
             self._reap_orphaned()
@@ -329,7 +364,11 @@ def main() -> None:
     parser.add_argument("--buffer_mb", type=int, default=512,
                         help="Safety memory buffer per GPU in MB (default: 512)")
     parser.add_argument("--grace_secs", type=float, default=30.0,
-                        help="Seconds to subtract recently-launched job memory from free (default: 30)")
+                        help="Seconds to hold grace-period memory reservation (default: 30)")
+    parser.add_argument("--max_gpus", type=int, default=None,
+                        help="Maximum GPUs any single job may request. "
+                             "Jobs exceeding this are immediately rejected. "
+                             "(default: no limit beyond total available GPUs)")
     parser.add_argument("--mock", action="store_true",
                         help="Run without real GPUs – simulate GPU state in memory")
     parser.add_argument("--mock_gpus", type=int, default=2,
@@ -348,6 +387,7 @@ def main() -> None:
         poll_interval=args.poll,
         buffer_mb=args.buffer_mb,
         grace_secs=args.grace_secs,
+        max_gpus=args.max_gpus,
         mock=args.mock,
         mock_gpus_count=args.mock_gpus,
         mock_gpu_mem_mb=int(args.mock_mem_gb * 1024),

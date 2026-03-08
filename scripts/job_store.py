@@ -22,11 +22,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id      TEXT    NOT NULL,
     cmd          TEXT    NOT NULL,
-    mem_mb       INTEGER NOT NULL,          -- requested GPU memory in MB
+    mem_mb       INTEGER NOT NULL,          -- requested GPU memory in MB (total across all GPUs)
+    num_gpus     INTEGER NOT NULL DEFAULT 1, -- number of GPUs requested
     est_secs     REAL    NOT NULL DEFAULT 0, -- estimated runtime in seconds (hint only)
     priority     INTEGER NOT NULL DEFAULT 0, -- higher value = higher priority
     status       TEXT    NOT NULL DEFAULT 'pending',  -- pending/running/done/failed/cancelled
-    gpu_id       INTEGER,                   -- assigned GPU index
+    gpu_id       TEXT,                      -- assigned GPU index(es), e.g. "0" or "0,1"
     pid          INTEGER,                   -- OS process ID of the running job
     submitted_at TEXT    NOT NULL DEFAULT (datetime('now')),
     started_at   TEXT,
@@ -47,7 +48,12 @@ class JobStore:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        # Migrate older databases that predate the num_gpus column
+        try:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN num_gpus INTEGER NOT NULL DEFAULT 1")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # ------------------------------------------------------------------
     # Write operations
@@ -58,14 +64,15 @@ class JobStore:
         user_id: str,
         cmd: str,
         mem_mb: int,
+        num_gpus: int = 1,
         est_secs: float = 0.0,
         priority: int = 0,
     ) -> int:
         """Insert a new job in 'pending' state. Returns job_id."""
         cur = self._conn.execute(
-            "INSERT INTO jobs (user_id, cmd, mem_mb, est_secs, priority, submitted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, cmd, mem_mb, est_secs, priority,
+            "INSERT INTO jobs (user_id, cmd, mem_mb, num_gpus, est_secs, priority, submitted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, cmd, mem_mb, num_gpus, est_secs, priority,
              datetime.now().isoformat(timespec="seconds")),
         )
         self._conn.commit()
@@ -84,6 +91,15 @@ class JobStore:
         self._conn.execute(
             "UPDATE jobs SET status=?, ended_at=?, exit_code=?, note=? WHERE job_id=?",
             (status, datetime.now().isoformat(timespec="seconds"), exit_code, note, job_id),
+        )
+        self._conn.commit()
+
+    def reject(self, job_id: int, reason: str) -> None:
+        """Immediately reject a pending job (marks it failed with a reason note)."""
+        self._conn.execute(
+            "UPDATE jobs SET status='failed', ended_at=?, exit_code=-1, note=? "
+            "WHERE job_id=? AND status='pending'",
+            (datetime.now().isoformat(timespec="seconds"), reason, job_id),
         )
         self._conn.commit()
 

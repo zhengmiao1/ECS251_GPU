@@ -13,13 +13,13 @@ memory — including GPUs that are already partially occupied by other jobs.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    scheduler.db  (SQLite)                 │
-│  jobs table: pending → running → done / failed / cancelled│
+│                   scheduler.db  (SQLite)                 │
+│ jobs table: pending → running → done / failed / cancelled│
 └──────────────────────────────────────────────────────────┘
           ▲  write                          ▲  write
           │                                 │
   submit.py / cancel.py            daemon.py (main loop)
-  (user-facing CLI)                    │
+  (user-facing CLI)                     │
                                         │ reads nvidia-smi
                                         ▼
                                   gpu_monitor.py
@@ -28,14 +28,14 @@ memory — including GPUs that are already partially occupied by other jobs.
 
 Five Python modules work together:
 
-| File | Role |
-|---|---|
+| File               | Role                                          |
+| ------------------ | --------------------------------------------- |
 | `gpu_monitor.py` | Query `nvidia-smi` for per-GPU memory stats |
-| `job_store.py` | SQLite-backed persistent job queue |
-| `daemon.py` | Main scheduling loop (runs continuously) |
-| `submit.py` | CLI: users submit new jobs |
-| `cancel.py` | CLI: cancel pending or kill running jobs |
-| `status.py` | CLI: inspect GPU state and job queue |
+| `job_store.py`   | SQLite-backed persistent job queue            |
+| `daemon.py`      | Main scheduling loop (runs continuously)      |
+| `submit.py`      | CLI: users submit new jobs                    |
+| `cancel.py`      | CLI: cancel pending or kill running jobs      |
+| `status.py`      | CLI: inspect GPU state and job queue          |
 
 ---
 
@@ -52,6 +52,7 @@ nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free \
 ```
 
 Returns a list of `GPUInfo` dataclasses:
+
 ```
 GPUInfo(gpu_id=0, name="NVIDIA A100", total_mem_mb=81920, used_mem_mb=12288, free_mem_mb=69632)
 ```
@@ -67,26 +68,28 @@ SQLite database (`scheduler.db`) with WAL mode for concurrent access.
 
 **Schema (jobs table):**
 
-| Column | Type | Description |
-|---|---|---|
-| `job_id` | INTEGER PK | Auto-increment |
-| `user_id` | TEXT | Who submitted |
-| `cmd` | TEXT | Shell command |
-| `mem_mb` | INTEGER | Requested GPU memory |
-| `est_secs` | REAL | Estimated runtime (scheduling hint) |
-| `priority` | INTEGER | Higher = scheduled sooner |
-| `status` | TEXT | `pending` / `running` / `done` / `failed` / `cancelled` |
-| `gpu_id` | INTEGER | Assigned GPU index |
-| `pid` | INTEGER | OS process ID |
-| `submitted_at` | TEXT | ISO timestamp |
-| `started_at` | TEXT | ISO timestamp |
-| `ended_at` | TEXT | ISO timestamp |
-| `exit_code` | INTEGER | Process exit code |
+| Column           | Type       | Description                                                       |
+| ---------------- | ---------- | ----------------------------------------------------------------- |
+| `job_id`       | INTEGER PK | Auto-increment                                                    |
+| `user_id`      | TEXT       | Who submitted                                                     |
+| `cmd`          | TEXT       | Shell command                                                     |
+| `mem_mb`       | INTEGER    | Requested GPU memory                                              |
+| `est_secs`     | REAL       | Estimated runtime (scheduling hint)                               |
+| `priority`     | INTEGER    | Higher = scheduled sooner                                         |
+| `status`       | TEXT       | `pending` / `running` / `done` / `failed` / `cancelled` |
+| `gpu_id`       | INTEGER    | Assigned GPU index                                                |
+| `pid`          | INTEGER    | OS process ID                                                     |
+| `submitted_at` | TEXT       | ISO timestamp                                                     |
+| `started_at`   | TEXT       | ISO timestamp                                                     |
+| `ended_at`     | TEXT       | ISO timestamp                                                     |
+| `exit_code`    | INTEGER    | Process exit code                                                 |
 
 **Pending job ordering** (most important for scheduling fairness):
+
 ```sql
 ORDER BY priority DESC, submitted_at ASC
 ```
+
 - High-priority jobs first
 - Among equal priority: FIFO (earlier submissions run first)
 
@@ -119,6 +122,7 @@ _recent: Dict[job_id → (gpu_id, mem_mb, launch_epoch)]
 ```
 
 When computing effective free memory for scheduling:
+
 ```
 effective_free[gpu] = nvidia-smi free_mem
                     - sum(mem_mb for jobs in _recent if now - launch < grace_secs)
@@ -135,6 +139,7 @@ return max(candidates, key=lambda g: candidates[g])
 ```
 
 Choosing the GPU with the *most* free memory (rather than least) tends to:
+
 - Leave smaller GPUs free for large future jobs
 - Reduce fragmentation across time
 
@@ -142,6 +147,7 @@ Choosing the GPU with the *most* free memory (rather than least) tends to:
 
 A fixed `buffer_mb` (default 512 MB) is subtracted from each GPU's free memory before
 scheduling.  This absorbs:
+
 - CUDA driver overhead (~100–200 MB)
 - Memory estimation errors in user submissions
 - Temporary fragmentation from CUDA allocator
@@ -157,6 +163,7 @@ This implements **FIFO** within each priority level: among jobs of equal priorit
 ### 4. `submit.py` — Job Submission
 
 Users specify:
+
 - `--user`: their identity (arbitrary string)
 - `--mem_gb`: peak GPU memory needed (converted to MB internally)
 - `--cmd`: the shell command to run
@@ -171,6 +178,7 @@ its next poll cycle (within `poll_interval` seconds).
 ### 5. Daemon: Job Launch
 
 When a job is dispatched, the daemon calls `subprocess.Popen` with:
+
 ```python
 env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)   # restricts the job to one GPU
 env["SCHEDULER_JOB_ID"] = str(job_id)       # passthrough for logging
@@ -191,6 +199,7 @@ GPUs based purely on memory availability.  Multiple jobs can run on the same GPU
 simultaneously, as long as the total committed memory fits.
 
 Example:
+
 ```
 GPU 0: 24 GB total
   - job 3: 8 GB   (running)
@@ -251,14 +260,14 @@ logic on any machine (including MacBooks without NVIDIA GPUs).
 
 ## Comparison with the Simulation (`scheduler.py`)
 
-| Aspect | Simulation (`scheduler.py`) | Real Daemon (`daemon.py`) |
-|---|---|---|
-| GPU state | Synthetic `GPUState` objects | Live `nvidia-smi` |
-| Job execution | Instant (simulated time) | Real OS processes |
-| Memory tracking | Exact (est_mem_gb) | Estimated + grace period |
-| Persistence | None (in-memory) | SQLite WAL |
-| Multi-user | Simulated user IDs | Real OS users |
-| Time | Discrete event simulation | Wall-clock |
+| Aspect          | Simulation (`scheduler.py`)  | Real Daemon (`daemon.py`) |
+| --------------- | ------------------------------ | --------------------------- |
+| GPU state       | Synthetic `GPUState` objects | Live `nvidia-smi`         |
+| Job execution   | Instant (simulated time)       | Real OS processes           |
+| Memory tracking | Exact (est_mem_gb)             | Estimated + grace period    |
+| Persistence     | None (in-memory)               | SQLite WAL                  |
+| Multi-user      | Simulated user IDs             | Real OS users               |
+| Time            | Discrete event simulation      | Wall-clock                  |
 
 The simulation is used for policy evaluation (comparing FIFO vs memory-aware);
 the daemon is the actual deployable scheduler.
@@ -281,6 +290,7 @@ ORDER(pending):
 ```
 
 Properties:
+
 - **No OOM**: job is dispatched only when effective free ≥ mem_mb + buffer
 - **GPU sharing**: multiple jobs per GPU allowed up to memory limit
 - **FIFO within priority**: among equal-priority jobs, earlier submissions run first
