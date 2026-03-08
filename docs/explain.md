@@ -85,11 +85,10 @@ SQLite database (`scheduler.db`) with WAL mode for concurrent access.
 
 **Pending job ordering** (most important for scheduling fairness):
 ```sql
-ORDER BY priority DESC, est_secs ASC, submitted_at ASC
+ORDER BY priority DESC, submitted_at ASC
 ```
 - High-priority jobs first
-- Among equal priority: shorter estimated runtime first (SRTF)
-- FIFO tiebreak on submission time
+- Among equal priority: FIFO (earlier submissions run first)
 
 ---
 
@@ -149,10 +148,9 @@ scheduling.  This absorbs:
 
 #### Job Ordering in the Pending Queue
 
-The `get_pending()` query returns jobs ordered by `priority DESC, est_secs ASC, submitted_at ASC`.
+The `get_pending()` query returns jobs ordered by `priority DESC, submitted_at ASC`.
 
-This implements **Shortest Remaining Time First (SRTF)** within each priority level.
-Long-running jobs are not starved because users can submit them with `--priority 1` or higher.
+This implements **FIFO** within each priority level: among jobs of equal priority, the one submitted earliest runs first.
 
 ---
 
@@ -279,13 +277,13 @@ ADMIT(job):
   else: dispatch to argmax(effective_free) in candidate_gpus
 
 ORDER(pending):
-  sort by (priority DESC, est_secs ASC, submitted_at ASC)
+  sort by (priority DESC, submitted_at ASC)
 ```
 
 Properties:
 - **No OOM**: job is dispatched only when effective free ≥ mem_mb + buffer
 - **GPU sharing**: multiple jobs per GPU allowed up to memory limit
-- **Short-first**: minimises average wait time for quick jobs
+- **FIFO within priority**: among equal-priority jobs, earlier submissions run first
 - **No starvation**: users can set higher priority; priority accumulation can be
   added later (aging)
 - **Crash safety**: SQLite WAL survives daemon restarts; orphaned jobs are reaped

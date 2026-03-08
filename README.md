@@ -200,7 +200,7 @@ python -m scripts.analysis --tasks 100 --seed 7 --workload mixed
 |---|---|---|
 | Memory source | `nvidia-smi` | Ground truth; handles any CUDA workload |
 | GPU sharing | Allowed | Maximises utilisation for inference/mixed workloads |
-| Job ordering | SRTF + priority | Minimises avg wait; no starvation via explicit priority |
+| Job ordering | FIFO + priority | Fair ordering within priority tier; no starvation via explicit priority |
 | Memory buffer | 512 MB default | Absorbs CUDA driver overhead + estimation errors |
 | Grace period | 30 s default | Prevents double-booking during CUDA context init lag |
 | Persistence | SQLite WAL | Survives daemon restart; concurrent read-access |

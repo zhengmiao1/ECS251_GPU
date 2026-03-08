@@ -123,12 +123,11 @@ class JobStore:
         """
         Return pending jobs ordered by:
           1. priority DESC (higher priority first)
-          2. est_secs ASC  (shorter jobs first – SRTF-like, anti-starvation via priority)
-          3. submitted_at ASC (FIFO tiebreak)
+          2. submitted_at ASC  (FIFO within same priority)
         """
         rows = self._conn.execute(
             "SELECT * FROM jobs WHERE status='pending' "
-            "ORDER BY priority DESC, est_secs ASC, submitted_at ASC"
+            "ORDER BY priority DESC, submitted_at ASC"
         ).fetchall()
         return [dict(r) for r in rows]
 
