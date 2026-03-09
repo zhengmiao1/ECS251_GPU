@@ -1,3 +1,16 @@
+'''
+This file is used to calculate the metrics for the scheduling algorithm.
+
+The metrics are:
+- Completed tasks
+- Average wait time
+- 95th percentile wait time
+- Average turnaround time
+- Throughput
+- Utilization
+- Fairness wait standard deviation
+- OOM events
+'''
 from __future__ import annotations
 
 import statistics

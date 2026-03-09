@@ -1,4 +1,4 @@
-{"arrival_time": 2.1740984258693468, "est_duration": 35.89686165836555, "est_mem_gb": 12, "event": "dispatch", "gpu_id": "gpu0", "now": 2.1740984258693468, "policy": "memory", "task_id": "t0", "user_id": "u5", "wait_time": 0.0}
+Í{"arrival_time": 2.1740984258693468, "est_duration": 35.89686165836555, "est_mem_gb": 12, "event": "dispatch", "gpu_id": "gpu0", "now": 2.1740984258693468, "policy": "memory", "task_id": "t0", "user_id": "u5", "wait_time": 0.0}
 {"arrival_time": 2.716294702468944, "est_duration": 773.2258840352388, "est_mem_gb": 20, "event": "dispatch", "gpu_id": "gpu1", "now": 2.716294702468944, "policy": "memory", "task_id": "t1", "user_id": "u5", "wait_time": 0.0}
 {"arrival_time": 4.8523368355708065, "est_duration": 42.918445526571354, "est_mem_gb": 12, "event": "dispatch", "gpu_id": "gpu0", "now": 4.8523368355708065, "policy": "memory", "task_id": "t2", "user_id": "u4", "wait_time": 0.0}
 {"arrival_time": 13.004865583056368, "est_duration": 615.1913134624469, "est_mem_gb": 24, "event": "defer", "now": 13.004865583056368, "policy": "memory", "reason": "temporary_memory_pressure", "task_id": "t3", "user_id": "u1"}
