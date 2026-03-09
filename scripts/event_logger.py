@@ -1,3 +1,15 @@
+'''
+This file is used to log the events for the scheduling algorithm.
+
+The events are:
+- task_submitted
+- task_scheduled
+- task_completed
+- task_failed
+- task_cancelled
+- task_killed
+- task_oom
+'''
 from __future__ import annotations
 
 import json

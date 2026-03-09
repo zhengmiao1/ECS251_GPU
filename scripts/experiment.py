@@ -1,3 +1,14 @@
+'''
+This file is used to run the scheduling algorithm and evaluate the performance.
+
+The experiment is run with the following parameters:
+- seeds: the seeds for the random number generator
+- tasks: the number of tasks
+- users: the number of users
+- gpus: the number of GPUs
+- gpu_mem: the memory of each GPU
+- short_threshold: the threshold for the short task
+'''
 from __future__ import annotations
 
 import argparse
