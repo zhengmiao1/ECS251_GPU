@@ -26,7 +26,7 @@ It supports:
 
 ---
 
-## Overview
+## Overview of the project
 
 This project provides a daemon-based scheduler that continuously monitors GPU availability and dispatches queued jobs as OS processes.
 
