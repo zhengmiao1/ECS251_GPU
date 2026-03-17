@@ -143,7 +143,7 @@ class JobStore:
         """
         rows = self._conn.execute(
             "SELECT * FROM jobs WHERE status='pending' "
-            "ORDER BY priority DESC, submitted_at ASC"
+            "ORDER BY priority DESC, submitted_at ASC, job_id ASC"
         ).fetchall()
         return [dict(r) for r in rows]
 

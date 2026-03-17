@@ -88,10 +88,10 @@ Each scenario is self-contained and starts from a clean state:
 
 | Scenario | What it shows |
 | --- | --- |
-| 1 — No Conflict | Jobs arrive on idle GPUs and are dispatched immediately, one per GPU |
-| 2 — GPU Sharing | New jobs are placed on busy GPUs that still have free memory |
-| 3 — Conflict | Queue forms; high-priority job jumps ahead; 3-GPU job rejected instantly |
-| 4 — Resolution | Short jobs finish; queue drains in priority order; large job waits for a nearly-empty GPU |
+| 1 — No Conflict | Two idle GPUs take new jobs immediately, one job per GPU |
+| 2 — GPU Sharing | New jobs share partially-used GPUs when enough memory remains |
+| 3 — Conflict | GPUs are too full to admit new work, so jobs wait in the queue |
+| 4 — Resolution | After running jobs finish, queued jobs are dispatched in priority order |
 
 ---
 

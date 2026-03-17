@@ -106,7 +106,7 @@ def print_snapshot(store: JobStore, ngpus: int, mem_mb: int,
     running_j  = [j for j in all_jobs if j["status"] == "running"]
     pending_j  = sorted(
         [j for j in all_jobs if j["status"] == "pending"],
-        key=lambda j: (-j["priority"], j["submitted_at"]),
+        key=lambda j: (-j["priority"], j["submitted_at"], j["job_id"]),
     )
     rejected_j = [j for j in all_jobs
                   if j["status"] == "failed"
@@ -207,12 +207,34 @@ def _w(secs: float, speed: float) -> None:
     time.sleep(secs / speed)
 
 
+def _jobs_by_user(store: JobStore) -> dict[str, dict]:
+    jobs = {}
+    for job in store.all_jobs(limit=200):
+        jobs[job["user_id"]] = job
+    return jobs
+
+
+def _wait_until(store: JobStore, speed: float, predicate, timeout: float = 8.0) -> dict[str, dict]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        jobs = _jobs_by_user(store)
+        if predicate(jobs):
+            return jobs
+        time.sleep(max(0.03, 0.15 / max(speed, 0.1)))
+    raise RuntimeError("demo state did not converge before timeout")
+
+
+def _is_running_on(jobs: dict[str, dict], user: str, gpu_id: int) -> bool:
+    job = jobs.get(user)
+    return bool(job and job["status"] == "running" and str(job.get("gpu_id")) == str(gpu_id))
+
+
 # ── Scenario 1: No Conflict ────────────────────────────────────────────────────
 
 def scenario_no_conflict(ngpus: int, mem_mb: int, speed: float) -> None:
     """
     Both GPUs are completely idle.
-    Alice (8 GB) and Bob (10 GB) are dispatched immediately,
+    Alice (10 GB) and Bob (12 GB) are dispatched immediately,
     one to each GPU — no waiting, no sharing.
     """
     print(c("bold", "\n" + "=" * 70))
@@ -223,10 +245,14 @@ def scenario_no_conflict(ngpus: int, mem_mb: int, speed: float) -> None:
     daemon, store, db_path, t0 = _start(ngpus, mem_mb, speed)
 
     print(c("dim", "\n  Submitting jobs:"))
-    _sub(store, "alice", 8,  1, real_dur=30, est_secs=3600, speed=speed)
+    _sub(store, "alice", 10, 1, real_dur=30, est_secs=3600, speed=speed)
     _w(0.3, speed)
-    _sub(store, "bob",  10,  1, real_dur=30, est_secs=2700, speed=speed)
-    _w(1.5, speed)   # wait for daemon to dispatch
+    _sub(store, "bob",  12, 1, real_dur=30, est_secs=2700, speed=speed)
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: _is_running_on(jobs, "alice", 0) and _is_running_on(jobs, "bob", 1),
+    )
 
     print_snapshot(store, ngpus, mem_mb,
                    "alice on GPU 0, bob on GPU 1 — each owns an idle GPU", t0)
@@ -254,7 +280,11 @@ def scenario_sharing(ngpus: int, mem_mb: int, speed: float) -> None:
     _sub(store, "alice", 10, 1, real_dur=30, est_secs=3600, speed=speed)
     _w(0.3, speed)
     _sub(store, "bob",  12, 1, real_dur=30, est_secs=2700, speed=speed)
-    _w(1.5, speed)
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: _is_running_on(jobs, "alice", 0) and _is_running_on(jobs, "bob", 1),
+    )
 
     print_snapshot(store, ngpus, mem_mb,
                    "After wave 1 — alice on GPU 0 (14 GB free), bob on GPU 1 (12 GB free)", t0)
@@ -263,7 +293,16 @@ def scenario_sharing(ngpus: int, mem_mb: int, speed: float) -> None:
     _sub(store, "carol", 6, 1, real_dur=30, est_secs=300, speed=speed)
     _w(0.3, speed)
     _sub(store, "dave",  4, 1, real_dur=30, est_secs=600, speed=speed)
-    _w(1.5, speed)
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: (
+            _is_running_on(jobs, "alice", 0)
+            and _is_running_on(jobs, "carol", 0)
+            and _is_running_on(jobs, "bob", 1)
+            and _is_running_on(jobs, "dave", 1)
+        ),
+    )
 
     print_snapshot(store, ngpus, mem_mb,
                    "After wave 2 — carol shares GPU 0, dave shares GPU 1", t0)
@@ -276,42 +315,47 @@ def scenario_conflict(ngpus: int, mem_mb: int, speed: float) -> None:
     """
     GPUs are nearly full (20 GB each used, only 3.5 GB free per GPU).
     Three jobs cannot fit and are queued.
-    Priority ordering: Grace (priority=2) goes ahead of Eve and Frank
-    despite submitting last.
-    Henry requests 3 GPUs but the limit is 2 — immediately rejected.
+    Priority ordering: Grace (priority=2) goes to the front of the queue.
 
-    Queue order: Grace Q1 (pri=2) → Eve Q2 (pri=0) → Frank Q3 (pri=0)
+    Queue order shown here: Grace Q1 (pri=2) → Frank Q2 → Eve Q3
     """
     print(c("bold", "\n" + "=" * 70))
-    print(c("bold", c("header", "  Scenario 3 — Conflict: Queue + Priority + Rejection")))
-    print(c("dim",  "  GPUs nearly full.  Jobs queue.  Priority and rejection shown."))
+    print(c("bold", c("header", "  Scenario 3 — Conflict: Queue Forms Under Memory Pressure")))
+    print(c("dim",  "  GPUs nearly full.  New jobs cannot fit and must wait in queue."))
     print(c("bold", "=" * 70))
 
-    daemon, store, db_path, t0 = _start(ngpus, mem_mb, speed, max_gpus=2)
+    daemon, store, db_path, t0 = _start(ngpus, mem_mb, speed)
 
     print(c("dim", "\n  Fill GPUs (20 GB each, leaving only ~3.5 GB free per GPU):"))
     _sub(store, "alice", 20, 1, real_dur=30, est_secs=7200, speed=speed)
     _w(0.3, speed)
     _sub(store, "bob",   20, 1, real_dur=30, est_secs=7200, speed=speed)
-    _w(1.5, speed)   # dispatch alice and bob
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: _is_running_on(jobs, "alice", 0) and _is_running_on(jobs, "bob", 1),
+    )
 
     print(c("dim", "\n  Submit jobs that cannot fit:"))
-    _sub(store, "eve",   18, 1, real_dur=10, est_secs=7200, speed=speed, priority=0)
-    _w(0.3, speed)
     _sub(store, "frank",  4, 1, real_dur=5,  est_secs=300,  speed=speed, priority=0)
+    _w(0.3, speed)
+    _sub(store, "eve",   18, 1, real_dur=10, est_secs=7200, speed=speed, priority=0)
     _w(0.2, speed)
     _sub(store, "grace",  4, 1, real_dur=5,  est_secs=300,  speed=speed, priority=2)
-    _w(0.3, speed)
-
-    print(c("dim", "\n  Submit henry (3 GPUs requested, limit is 2 → rejected):"))
-    jid = store.submit(user_id="henry", cmd="sleep 99",
-                       mem_mb=16*1024, num_gpus=3, est_secs=3600, priority=0)
-    print(c("dim", f"    submit #{jid:<2}  henry    16 GB  3GPUs  "
-            f"{c('rejected', '[3 GPUs > max_gpus=2 → will be rejected]')}"))
-    _w(2.0, speed)   # let daemon reject henry
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: (
+            _is_running_on(jobs, "alice", 0)
+            and _is_running_on(jobs, "bob", 1)
+            and jobs.get("grace", {}).get("status") == "pending"
+            and jobs.get("frank", {}).get("status") == "pending"
+            and jobs.get("eve", {}).get("status") == "pending"
+        ),
+    )
 
     print_snapshot(store, ngpus, mem_mb,
-                   "Queue: grace Q1 (pri=2) → eve Q2 → frank Q3   henry rejected", t0)
+                   "Queue: grace Q1 (pri=2) → frank Q2 → eve Q3", t0)
     _cleanup(daemon, store, db_path)
 
 
@@ -339,7 +383,11 @@ def scenario_resolution(ngpus: int, mem_mb: int, speed: float) -> None:
     _sub(store, "alice", 20, 1, real_dur=8, est_secs=7200, speed=speed)
     _w(0.3, speed)
     _sub(store, "bob",   20, 1, real_dur=8, est_secs=7200, speed=speed)
-    _w(1.5, speed)   # dispatch alice and bob
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: _is_running_on(jobs, "alice", 0) and _is_running_on(jobs, "bob", 1),
+    )
 
     print(c("dim", "\n  Submit queued jobs while GPUs are full:"))
     _sub(store, "eve",   18, 1, real_dur=8, est_secs=7200, speed=speed, priority=0)
@@ -347,14 +395,33 @@ def scenario_resolution(ngpus: int, mem_mb: int, speed: float) -> None:
     _sub(store, "frank",  4, 1, real_dur=5, est_secs=300,  speed=speed, priority=0)
     _w(0.2, speed)
     _sub(store, "grace",  4, 1, real_dur=5, est_secs=300,  speed=speed, priority=2)
-    _w(1.5, speed)
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: (
+            _is_running_on(jobs, "alice", 0)
+            and _is_running_on(jobs, "bob", 1)
+            and jobs.get("grace", {}).get("status") == "pending"
+            and jobs.get("frank", {}).get("status") == "pending"
+            and jobs.get("eve", {}).get("status") == "pending"
+        ),
+    )
 
     print_snapshot(store, ngpus, mem_mb,
-                   "Step 1 — alice and bob running; grace Q1, eve Q2, frank Q3 waiting", t0)
+                   "Step 1 — alice and bob running; grace, frank, and eve are queued", t0)
 
-    # alice/bob finish at ~t=9 (started ~t=1, run 8s)
-    # wait until ~t=11 to give daemon time to dispatch queued jobs
-    _w(7.0, speed)
+    _wait_until(
+        store,
+        speed,
+        lambda jobs: (
+            jobs.get("alice", {}).get("status") == "done"
+            and jobs.get("bob", {}).get("status") == "done"
+            and _is_running_on(jobs, "grace", 0)
+            and _is_running_on(jobs, "frank", 0)
+            and _is_running_on(jobs, "eve", 1)
+        ),
+        timeout=20.0,
+    )
 
     print_snapshot(store, ngpus, mem_mb,
                    "Step 2 — grace dispatched first (pri=2); eve on GPU 1; frank shares GPU 0",
