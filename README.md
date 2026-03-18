@@ -29,7 +29,6 @@ This project supports:
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -105,9 +104,7 @@ Stop daemon with `Ctrl+C`.
 
 ---
 
-## Usage
-
-### CLI commands (cheat sheet)
+## Usage (CLI Cheat Sheet)
 
 | Command | Purpose | Example |
 | --- | --- | --- |
@@ -140,8 +137,6 @@ When dispatching pending jobs, the scheduler applies:
 ---
 
 ## Project Plan to Code Mapping
-
-This section maps core project-plan concepts to concrete modules in the repository.
 
 | Project-plan concept | Implementation location | Notes |
 | --- | --- | --- |
@@ -214,16 +209,6 @@ Common daemon options:
   - Expected if GPU memory is insufficient; verify with `scripts.status`
 - Command exits unexpectedly
   - Check CLI arguments and DB path consistency (`--db` should match daemon)
-
----
-
-## Contributing 🤝
-
-For course work, keep PRs small and include:
-
-- what changed
-- why it changed
-- how to reproduce/test (`daemon`, `submit`, `status`, `demo` commands)
 
 ---
 
