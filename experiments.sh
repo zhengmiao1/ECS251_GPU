@@ -1,0 +1,2 @@
+python -m scripts.experiment --batch --tasks 300 --users 5 --gpus 4 --gpu_mem 40 --short_threshold 180 --aging_window 120 --inter_arrival_mean 8 --buffer_gb 6 --grace_secs 35 --seeds 7,11,19,23,31
+python -m scripts.param_sweep   --workload mixed   --tasks 300   --users 5   --gpus 4   --gpu_mem 40   --short_threshold 180   --aging_window 120   --grace_secs 35   --inter_arrival_mean 6   --buffer_pcts 0,5,10,15,20   --seeds 7,11,19,23,31

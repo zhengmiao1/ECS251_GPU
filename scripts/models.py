@@ -11,7 +11,9 @@ class Task:
     arrival_time: float
     est_duration: float
     est_mem_gb: float
-    duration_class: str  # "short" or "long"
+    duration_class: str  # "small" / "medium" / "large" (legacy values still accepted)
+    startup_spike_gb: float = 0.0
+    spike_secs: float = 0.0
 
 
 @dataclass
@@ -51,6 +53,7 @@ class TaskResult:
     start_time: float
     end_time: float
     wait_time: float
+    status: str = "done"  # "done" or "oom_killed"
 
 
 @dataclass

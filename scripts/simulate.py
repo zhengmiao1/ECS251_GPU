@@ -11,8 +11,17 @@ from .scheduler import FIFOScheduler, MemoryAwareScheduler, SchedulerConfig, bui
 from .metrics import summarize_results
 
 
-def _duration_class(duration: float, threshold: float) -> str:
-    return "short" if duration <= threshold else "long"
+_WORKLOAD_MIX = {
+    "llm_heavy": {"small": 0.70, "medium": 0.20, "large": 0.10},
+    "mixed": {"small": 0.40, "medium": 0.30, "large": 0.30},
+    "vlm_heavy": {"small": 0.10, "medium": 0.20, "large": 0.70},
+}
+
+_PROFILE_SPECS = {
+    "small": {"mem": (4.0, 12.0), "dur": (30.0, 120.0), "spike_ratio": (0.20, 0.45), "spike_secs": (8.0, 20.0)},
+    "medium": {"mem": (16.0, 24.0), "dur": (200.0, 600.0), "spike_ratio": (0.12, 0.28), "spike_secs": (10.0, 24.0)},
+    "large": {"mem": (28.0, 36.0), "dur": (800.0, 1800.0), "spike_ratio": (0.05, 0.18), "spike_secs": (12.0, 30.0)},
+}
 
 
 def generate_tasks(
@@ -21,35 +30,36 @@ def generate_tasks(
     seed: int,
     short_threshold: float,
     workload: str,
+    inter_arrival_mean: float = 8.0,
 ) -> List[Task]:
     random.seed(seed)
     tasks: List[Task] = []
     now = 0.0
+    mix = _WORKLOAD_MIX[workload]
+    profile_names = list(mix.keys())
+    profile_weights = list(mix.values())
     for i in range(n):
-        inter_arrival = random.expovariate(1.0 / 8.0)
+        # Poisson arrivals: expovariate(lambda), lambda = 1 / mean_interarrival
+        inter_arrival = random.expovariate(1.0 / inter_arrival_mean)
         now += inter_arrival
 
-        if workload == "llm_heavy":
-            long_prob = 0.2
-        elif workload == "vlm_heavy":
-            long_prob = 0.8
-        else:
-            long_prob = 0.4
-
-        if random.random() < long_prob:
-            duration = random.uniform(120, 900)
-            mem_gb = random.choice([14, 16, 20, 24])
-        else:
-            duration = random.uniform(10, 80)
-            mem_gb = random.choice([6, 8, 10, 12])
+        profile = random.choices(profile_names, weights=profile_weights, k=1)[0]
+        spec = _PROFILE_SPECS[profile]
+        duration = random.uniform(*spec["dur"])
+        mem_gb = random.uniform(*spec["mem"])
+        spike_ratio = random.uniform(*spec["spike_ratio"])
+        startup_spike_gb = mem_gb * spike_ratio
+        spike_secs = random.uniform(*spec["spike_secs"])
 
         task = Task(
             task_id=f"t{i}",
             user_id=f"u{random.randint(1, users)}",
             arrival_time=now,
             est_duration=duration,
-            est_mem_gb=mem_gb,
-            duration_class=_duration_class(duration, short_threshold),
+            est_mem_gb=round(mem_gb, 3),
+            duration_class=profile,
+            startup_spike_gb=round(startup_spike_gb, 3),
+            spike_secs=round(spike_secs, 3),
         )
         tasks.append(task)
     return tasks
@@ -173,10 +183,11 @@ def main() -> None:
     parser.add_argument("--gpus", type=int, default=2)
     parser.add_argument("--gpu_mem", type=float, default=24.0)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--short_threshold", type=float, default=60.0)
+    parser.add_argument("--short_threshold", type=float, default=120.0)
     parser.add_argument("--aging_window", type=float, default=180.0)
     parser.add_argument("--policy", choices=["memory", "fifo", "both"], default="both")
     parser.add_argument("--workload", choices=["mixed", "llm_heavy", "vlm_heavy"], default="mixed")
+    parser.add_argument("--inter_arrival_mean", type=float, default=8.0)
     parser.add_argument("--log_dir", type=str, default="")
     # Replay mode (Zaishuo Xia, Week 4)
     parser.add_argument(
@@ -210,6 +221,7 @@ def main() -> None:
         seed=args.seed,
         short_threshold=args.short_threshold,
         workload=args.workload,
+        inter_arrival_mean=args.inter_arrival_mean,
     )
 
     policies = ["memory", "fifo"] if args.policy == "both" else [args.policy]

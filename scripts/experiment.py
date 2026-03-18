@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .metrics import summarize_results
-from .scheduler import FIFOScheduler, MemoryAwareScheduler, SchedulerConfig, build_default_gpus
+from .scheduler import (
+    ExclusiveFIFOScheduler,
+    MemoryAwareScheduler,
+    NaiveSharingScheduler,
+    SchedulerConfig,
+    build_default_gpus,
+)
 from .simulate import generate_tasks
 
 
@@ -34,10 +39,13 @@ def run_experiment(
     gpu_mem: float,
     short_threshold: float,
     aging_window: float,
+    buffer_gb: float,
+    grace_secs: float,
     workload: str,
+    inter_arrival_mean: float,
     out_db: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
-    reports: Dict[str, List[Dict[str, float]]] = {"memory": [], "fifo": []}
+    reports: Dict[str, List[Dict[str, float]]] = {"exclusive": [], "naive": [], "mas": []}
 
     store = None
     if out_db:
@@ -51,16 +59,26 @@ def run_experiment(
             seed=seed,
             short_threshold=short_threshold,
             workload=workload,
+            inter_arrival_mean=inter_arrival_mean,
         )
 
-        memory_scheduler = MemoryAwareScheduler(
+        mas_scheduler = MemoryAwareScheduler(
+            gpus=build_default_gpus(gpus, gpu_mem),
+            config=SchedulerConfig(
+                short_threshold=short_threshold,
+                aging_window=aging_window,
+                buffer_gb=buffer_gb,
+                grace_secs=grace_secs,
+            ),
+        )
+        naive_scheduler = NaiveSharingScheduler(
             gpus=build_default_gpus(gpus, gpu_mem),
             config=SchedulerConfig(
                 short_threshold=short_threshold,
                 aging_window=aging_window,
             ),
         )
-        fifo_scheduler = FIFOScheduler(
+        exclusive_scheduler = ExclusiveFIFOScheduler(
             gpus=build_default_gpus(gpus, gpu_mem),
             config=SchedulerConfig(
                 short_threshold=short_threshold,
@@ -68,9 +86,13 @@ def run_experiment(
             ),
         )
 
-        for policy_name, scheduler in [("memory", memory_scheduler), ("fifo", fifo_scheduler)]:
+        for policy_name, scheduler in [
+            ("exclusive", exclusive_scheduler),
+            ("naive", naive_scheduler),
+            ("mas", mas_scheduler),
+        ]:
             result = scheduler.schedule(task_list)
-            reports[policy_name].append(summarize_results(result, num_gpus=gpus))
+            reports[policy_name].append(summarize_results(result, num_gpus=gpus, gpu_mem_gb=gpu_mem))
             if store:
                 run_id = store.insert_run(
                     policy=policy_name,
@@ -87,7 +109,7 @@ def run_experiment(
         store.close()
 
     summary: Dict[str, Dict[str, float]] = {}
-    keys = reports["memory"][0].keys() if reports["memory"] else []
+    keys = reports["mas"][0].keys() if reports["mas"] else []
     for policy, policy_reports in reports.items():
         summary[policy] = {k: round(_mean([r[k] for r in policy_reports]), 4) for k in keys}
     return summary
@@ -95,12 +117,15 @@ def run_experiment(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tasks", type=int, default=200)
+    parser.add_argument("--tasks", type=int, default=300)
     parser.add_argument("--users", type=int, default=5)
-    parser.add_argument("--gpus", type=int, default=2)
-    parser.add_argument("--gpu_mem", type=float, default=24.0)
-    parser.add_argument("--short_threshold", type=float, default=60.0)
+    parser.add_argument("--gpus", type=int, default=4)
+    parser.add_argument("--gpu_mem", type=float, default=40.0)
+    parser.add_argument("--short_threshold", type=float, default=120.0)
     parser.add_argument("--aging_window", type=float, default=180.0)
+    parser.add_argument("--buffer_gb", type=float, default=4.0, help="MAS safety buffer in GB")
+    parser.add_argument("--grace_secs", type=float, default=20.0, help="MAS grace reservation window")
+    parser.add_argument("--inter_arrival_mean", type=float, default=8.0, help="Poisson mean inter-arrival seconds")
     parser.add_argument("--workload", choices=["mixed", "llm_heavy", "vlm_heavy"], default="mixed")
     parser.add_argument("--seeds", type=str, default="7,11,19,23,31")
     parser.add_argument("--out_csv", type=str, default="")
@@ -129,17 +154,24 @@ def main() -> None:
             gpu_mem=args.gpu_mem,
             short_threshold=args.short_threshold,
             aging_window=args.aging_window,
+            buffer_gb=args.buffer_gb,
+            grace_secs=args.grace_secs,
             workload=workload,
+            inter_arrival_mean=args.inter_arrival_mean,
             out_db=args.out_db or None,
         )
 
         print(f"\nworkload={workload}, seeds={seeds}")
-        print("policy, completed_tasks, avg_wait_time, p95_wait_time, avg_turnaround, throughput, utilization, fairness_wait_std, oom_events")
-        for policy in ["fifo", "memory"]:
+        print(
+            "policy, completed_tasks, avg_wait_time, makespan, utilization_pct, oom_rate_pct, "
+            "p95_wait_time, avg_turnaround, throughput, fairness_wait_std, oom_events"
+        )
+        for policy in ["exclusive", "naive", "mas"]:
             r = summary[policy]
             print(
-                f"{policy}, {r['completed_tasks']}, {r['avg_wait_time']}, {r['p95_wait_time']}, "
-                f"{r['avg_turnaround']}, {r['throughput']}, {r['utilization']}, {r['fairness_wait_std']}, {r['oom_events']}"
+                f"{policy}, {r['completed_tasks']}, {r['avg_wait_time']}, {r['makespan']}, "
+                f"{r['utilization_pct']}, {r['oom_rate_pct']}, {r['p95_wait_time']}, "
+                f"{r['avg_turnaround']}, {r['throughput']}, {r['fairness_wait_std']}, {r['oom_events']}"
             )
 
         if args.out_csv:
@@ -150,8 +182,8 @@ def main() -> None:
                 csv_path = args.out_csv
             with open(csv_path, "w", newline="", encoding="utf-8") as fp:
                 writer = csv.writer(fp)
-                writer.writerow(["policy", *summary["memory"].keys()])
-                for policy in ["fifo", "memory"]:
+                writer.writerow(["policy", *summary["mas"].keys()])
+                for policy in ["exclusive", "naive", "mas"]:
                     writer.writerow([policy, *[summary[policy][k] for k in summary[policy].keys()]])
             print(f"saved_csv={csv_path}")
 
