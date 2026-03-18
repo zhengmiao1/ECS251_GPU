@@ -2,12 +2,19 @@
 
 A lightweight GPU job scheduler for multi-user environments.
 
-It supports:
+This project supports:
 - per-job GPU count and memory requests
 - queueing when resources are insufficient
 - priority + FIFO scheduling
 - optional per-job GPU cap
 - real GPU mode (`nvidia-smi`) and mock mode (no GPU required)
+
+---
+
+## Repository
+
+- Code repository: `https://github.com/zhengmiao1/ECS251_GPU`
+- Branch used for submission: `main`
 
 ---
 
@@ -17,6 +24,7 @@ It supports:
 - [Quick Start (3 minutes)](#quick-start-3-minutes)
 - [Usage](#usage)
 - [Scheduling Policy](#scheduling-policy)
+- [Project Plan to Code Mapping](#project-plan-to-code-mapping)
 - [Simulation Mode (No GPU)](#simulation-mode-no-gpu)
 - [Project Structure](#project-structure)
 - [Configuration](#configuration)
@@ -26,7 +34,7 @@ It supports:
 
 ---
 
-## Overview of the project
+## Overview
 
 This project provides a daemon-based scheduler that continuously monitors GPU availability and dispatches queued jobs as OS processes.
 
@@ -127,7 +135,25 @@ When dispatching pending jobs, the scheduler applies:
    - If none can fit, use busy GPUs with enough remaining memory
 
 4. **Backpressure**
-   - If memory is insufficient on all GPUs, keep job pending in queue
+   - If memory is insufficient on all GPUs, keep the job pending in queue
+
+---
+
+## Project Plan to Code Mapping
+
+This section maps core project-plan concepts to concrete modules in the repository.
+
+| Project-plan concept | Implementation location | Notes |
+| --- | --- | --- |
+| Job submission interface | `scripts/submit.py` | Validates user request fields and writes jobs to the queue store |
+| Persistent job queue | `scripts/job_store.py` | Stores pending/running/completed jobs in SQLite |
+| GPU monitoring | `scripts/gpu_monitor.py` | Reads GPU state from `nvidia-smi` (real mode) or mock state |
+| Scheduling loop | `scripts/daemon.py` | Polls resources, selects dispatchable jobs, and launches processes |
+| Priority + FIFO policy | `scripts/daemon.py` | Higher priority first; same priority in submission order |
+| Per-job GPU limit enforcement | `scripts/daemon.py` | Rejects requests beyond `--max_gpus` |
+| Status inspection | `scripts/status.py` | Prints queue state and GPU utilization summary |
+| Job cancellation / force stop | `scripts/cancel.py` | Cancels pending jobs or force-stops running jobs |
+| No-GPU scenario simulation | `scripts/demo.py` | Reproducible mock scenarios for validation and demonstration |
 
 ---
 
@@ -195,9 +221,9 @@ Common daemon options:
 
 For course work, keep PRs small and include:
 
-- What changed
-- Why it changed
-- How to reproduce/test (`daemon`, `submit`, `status`, `demo` commands)
+- what changed
+- why it changed
+- how to reproduce/test (`daemon`, `submit`, `status`, `demo` commands)
 
 ---
 
